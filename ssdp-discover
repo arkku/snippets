@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""SSDP discovery testing tool."""
+
+# Built entirely by AI. But it works for testing SSDP.
+
+import argparse
+import signal
+import socket
+import struct
+import select
+import sys
+
+SSDP_ADDR_V4 = "239.255.255.250"
+SSDP_ADDR_V6 = "ff02::c"
+SSDP_PORT = 1900
+
+MSEARCH_TEMPLATE_V4 = """\
+M-SEARCH * HTTP/1.1\r
+HOST: {addr}:{port}\r
+MAN: "ssdp:discover"\r
+MX: {mx}\r
+ST: {st}\r
+\r
+"""
+
+MSEARCH_TEMPLATE_V6 = """\
+M-SEARCH * HTTP/1.1\r
+HOST: [{addr}]:{port}\r
+MAN: "ssdp:discover"\r
+MX: {mx}\r
+ST: {st}\r
+\r
+"""
+
+
+def discover(port=SSDP_PORT, timeout=None, mx=3, st="ssdp:all", interface=None, src_port=0, ipv6=False):
+    """Send M-SEARCH and collect responses + NOTIFY announcements."""
+    
+    if ipv6:
+        family = socket.AF_INET6
+        ssdp_addr = SSDP_ADDR_V6
+        msearch_template = MSEARCH_TEMPLATE_V6
+    else:
+        family = socket.AF_INET
+        ssdp_addr = SSDP_ADDR_V4
+        msearch_template = MSEARCH_TEMPLATE_V4
+    
+    # Socket for sending M-SEARCH and receiving unicast responses
+    send_sock = socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    if ipv6:
+        send_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 4)
+        if interface:
+            # Get interface index for IPv6
+            if_index = socket.if_nametoindex(interface)
+            send_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, if_index)
+        send_sock.bind(("::", src_port))
+    else:
+        send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+        if interface:
+            send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode())
+        send_sock.bind(("", src_port))
+    
+    local_addr = send_sock.getsockname()
+    print(f"Send socket bound to {local_addr[0]}:{local_addr[1]}", file=sys.stderr)
+    
+    # Socket for receiving multicast/broadcast NOTIFY announcements
+    mcast_sock = socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    mcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    if ipv6:
+        mcast_sock.bind(("::", port))
+        # Join multicast group
+        if interface:
+            if_index = socket.if_nametoindex(interface)
+        else:
+            if_index = 0
+        mreq = struct.pack("16sI", socket.inet_pton(socket.AF_INET6, ssdp_addr), if_index)
+        mcast_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+    else:
+        mcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        mcast_sock.bind(("", port))
+        # Join multicast group
+        if interface:
+            import fcntl
+            SIOCGIFADDR = 0x8915
+            ifreq = struct.pack('256s', interface.encode()[:15])
+            try:
+                result = fcntl.ioctl(mcast_sock.fileno(), SIOCGIFADDR, ifreq)
+                iface_ip = socket.inet_ntoa(result[20:24])
+            except OSError:
+                iface_ip = "0.0.0.0"
+            mreq = struct.pack("4s4s", socket.inet_aton(ssdp_addr), socket.inet_aton(iface_ip))
+        else:
+            mreq = struct.pack("4sl", socket.inet_aton(ssdp_addr), socket.INADDR_ANY)
+        mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    
+    print(f"Joined multicast group {ssdp_addr}:{port}", file=sys.stderr)
+    
+    # Build and send M-SEARCH
+    msg = msearch_template.format(addr=ssdp_addr, port=port, mx=mx, st=st)
+    print(f"Sending M-SEARCH to {ssdp_addr}:{port} (ST={st}, MX={mx})", file=sys.stderr)
+    
+    if ipv6:
+        # For IPv6 link-local multicast, we may need to specify the interface
+        if interface:
+            if_index = socket.if_nametoindex(interface)
+            send_sock.sendto(msg.encode(), (ssdp_addr, port, 0, if_index))
+        else:
+            send_sock.sendto(msg.encode(), (ssdp_addr, port))
+    else:
+        send_sock.sendto(msg.encode(), (ssdp_addr, port))
+    
+    # Collect responses
+    if timeout:
+        print(f"Waiting {timeout}s for responses (Ctrl-C to stop)...\n", file=sys.stderr)
+    else:
+        print("Waiting for responses (Ctrl-C to stop)...\n", file=sys.stderr)
+    
+    import time
+    start_time = time.monotonic()
+    responses = {}  # ip -> list of info dicts
+    running = True
+    
+    def handle_sigint(sig, frame):
+        nonlocal running
+        running = False
+    
+    signal.signal(signal.SIGINT, handle_sigint)
+    
+    sockets = [send_sock, mcast_sock]
+    
+    while running:
+        ready, _, _ = select.select(sockets, [], [], 1.0)
+        if not ready:
+            if timeout:
+                timeout -= 1
+                if timeout <= 0:
+                    break
+            continue
+        
+        for sock in ready:
+            try:
+                data, addr = sock.recvfrom(4096)
+                text = data.decode("utf-8", errors="replace")
+                
+                # Determine packet type
+                if text.startswith("M-SEARCH"):
+                    pkt_type = "M-SEARCH"
+                elif text.startswith("NOTIFY"):
+                    pkt_type = "NOTIFY"
+                elif text.startswith("HTTP"):
+                    pkt_type = "RESPONSE"
+                else:
+                    pkt_type = "UNKNOWN"
+                
+                # Extract useful info
+                location = ""
+                server = ""
+                nt = ""
+                for line in text.split("\r\n"):
+                    lower = line.lower()
+                    if lower.startswith("location:"):
+                        location = line.split(":", 1)[1].strip()
+                    elif lower.startswith("server:"):
+                        server = line.split(":", 1)[1].strip()
+                    elif lower.startswith("nt:"):
+                        nt = line.split(":", 1)[1].strip()
+                
+                ip = addr[0]
+                sock_name = "mcast/bcast" if sock == mcast_sock else "unicast"
+                elapsed = time.monotonic() - start_time
+                
+                # Also extract ST (search target) from responses
+                st_value = ""
+                usn = ""
+                for line in text.split("\r\n"):
+                    lower = line.lower()
+                    if lower.startswith("st:"):
+                        st_value = line.split(":", 1)[1].strip()
+                    elif lower.startswith("usn:"):
+                        usn = line.split(":", 1)[1].strip()
+                
+                # Use location or NT/ST as service identifier
+                service = location or nt or st_value or usn or "(unknown)"
+                
+                if ip not in responses:
+                    responses[ip] = []
+                
+                responses[ip].append({
+                    "port": addr[1],
+                    "type": pkt_type,
+                    "location": location,
+                    "server": server,
+                    "nt": nt,
+                    "st": st_value,
+                    "usn": usn,
+                    "service": service,
+                    "method": sock_name,
+                    "elapsed": elapsed,
+                })
+                
+                print(f"=== {pkt_type} from {addr[0]}:{addr[1]} ({sock_name}) ===")
+                print(text)
+                print()
+            except socket.error as e:
+                print(f"Socket error: {e}", file=sys.stderr)
+                break
+    
+    send_sock.close()
+    mcast_sock.close()
+    return responses
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SSDP M-SEARCH discovery tool")
+    parser.add_argument("-p", "--port", type=int, default=SSDP_PORT,
+                        help=f"SSDP port (default: {SSDP_PORT})")
+    parser.add_argument("-t", "--timeout", type=int, default=None,
+                        help="Timeout in seconds (default: wait for Ctrl-C)")
+    parser.add_argument("-m", "--mx", type=int, default=3,
+                        help="MX value - max wait time for devices (default: 3)")
+    parser.add_argument("-s", "--st", default="ssdp:all",
+                        help="Search target (default: ssdp:all)")
+    parser.add_argument("-i", "--interface", default=None,
+                        help="Bind to specific interface (e.g., eth0)")
+    parser.add_argument("--src-port", type=int, default=0,
+                        help="Source port for M-SEARCH (default: random)")
+    parser.add_argument("-6", "--ipv6", action="store_true",
+                        help="Use IPv6 instead of IPv4")
+    
+    args = parser.parse_args()
+    
+    responses = discover(
+        port=args.port,
+        timeout=args.timeout,
+        mx=args.mx,
+        st=args.st,
+        interface=args.interface,
+        src_port=args.src_port,
+        ipv6=args.ipv6
+    )
+    
+    if not responses:
+        print("No responses received.", file=sys.stderr)
+    else:
+        # Collect all (ip, service) pairs with their info
+        all_entries = []
+        for ip, infos in responses.items():
+            # Group by service
+            by_service = {}
+            for info in infos:
+                svc = info["service"]
+                if svc not in by_service:
+                    by_service[svc] = []
+                by_service[svc].append(info)
+            
+            for service, svc_infos in by_service.items():
+                # Get first occurrence time and methods used
+                first_elapsed = min(i["elapsed"] for i in svc_infos)
+                methods = sorted(set(i["method"] for i in svc_infos))
+                types = sorted(set(i["type"] for i in svc_infos))
+                count = len(svc_infos)
+                server = next((i["server"] for i in svc_infos if i["server"]), "")
+                
+                all_entries.append({
+                    "ip": ip,
+                    "service": service,
+                    "elapsed": first_elapsed,
+                    "methods": methods,
+                    "types": types,
+                    "count": count,
+                    "server": server,
+                })
+        
+        # Sort by first seen time
+        all_entries.sort(key=lambda x: x["elapsed"])
+        
+        for entry in all_entries:
+            methods_str = "+".join(entry["methods"])
+            types_str = ",".join(entry["types"])
+            dup_str = f" x{entry['count']}" if entry["count"] > 1 else ""
+            
+            # Truncate service for display
+            service_display = entry["service"]
+            if len(service_display) > 60:
+                service_display = service_display[:57] + "..."
+            
+            line = f"{entry['elapsed']:5.1f}s {methods_str:20s} {entry['ip']:15s} [{types_str:8s}]{dup_str}"
+            if entry["server"]:
+                line += f"  {entry['server'][:30]}"
+            print(line)
+            print(f"       {service_display}")
+        
+        # Count unique IPs and services
+        unique_ips = len(responses)
+        unique_services = len(all_entries)
+        print(f"\nTotal: {unique_ips} unique IPs, {unique_services} unique (IP, service) pairs", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
